@@ -1,0 +1,151 @@
+﻿FUNCTION_BLOCK "FB_AO_FromPID_v1"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      rPid_Out_EU : Real;   // e.g., 35..50 Hz
+      rIn_EU_Min : Real;   // engineering min (e.g., 35.0)
+      rIn_EU_Max : Real;   // engineering max (e.g., 50.0)
+      bEnable : Bool := true;   // global enable
+      rStart_Th_EU : Real;   // AO active only if rPid_Out_EU >= this
+      rSlewUp_EUps : Real;   // Slew (rate limit) in EU units per second ( 0 = no limit )
+      rSlewDn_EUps : Real;   // Slew (rate limit) in EU units per second ( 0 = no limit )
+      rTs_s : Real := 0.1;   // e.g., OB1 ~100 ms
+      bHold : Bool;   // Hold output (freeze AO)
+      iAO_Type : Int;   // 0=I_4_20, 1=I_0_20, 2=V_0_10
+   END_VAR
+
+   VAR_OUTPUT 
+      rCmd_EU : Real;   // slewed & limited EU
+      iRaw_AO : Int;   // 0..27648
+      rRaw_AO_Real : Real;   // same as REAL
+      bActive : Bool;   // enabled & above start threshold
+      bClamped : Bool;   // input clamped to range
+      bClamped_EU : Bool;
+      bClamped_RAW : Bool;
+      bSlewed : Bool;   // slew applied this scan
+   END_VAR
+
+   VAR 
+      rRAW_FS : Real := 27648.0;
+      rTarget_EU : Real;
+      rPrev_EU : Real;
+      rStepUpMax : Real;
+      rStepDnMax : Real;
+      rSpanEU : Real;
+      rFrac : Real;
+      rTmp : Real;
+      iType : Int;
+      rTarget_EU_Uncl : Real;
+   END_VAR
+
+
+BEGIN
+	//FUNCTION_BLOCK FB_AO_FromPID_v1
+	//S7_Optimized_Access := 'TRUE' 
+	// PID EU -> AO RAW (0..27648) with enable, threshold, slew and explicit clamp flags
+	// AO types: 0=I_4_20mA, 1=I_0_20mA, 2=V_0_10V
+	
+	#rCmd_EU := 0.0;
+	
+	// ---- aktywność AO
+	#bActive := #bEnable AND (#rPid_Out_EU >= #rStart_Th_EU);
+	
+	// ---- typ AO
+	IF #iAO_Type < 0 THEN
+	    #iType := 0;
+	ELSIF #iAO_Type > 2 THEN
+	    #iType := 2;
+	ELSE
+	    #iType := #iAO_Type;
+	END_IF;
+	
+	// ---- zakres EU
+	#rSpanEU := #rIn_EU_Max - #rIn_EU_Min;
+	IF #rSpanEU = 0.0 THEN
+	    #rSpanEU := 1.0;
+	END_IF;
+	
+	// ---- target EU przed clampem
+	IF #bActive THEN
+	    #rTarget_EU_Uncl := #rPid_Out_EU;
+	ELSE
+	    #rTarget_EU_Uncl := #rIn_EU_Min;  // brak aktywności -> schodzimy do minimum
+	END_IF;
+	
+	// ---- clamp EU + flagi
+	#bClamped_EU := (#rTarget_EU_Uncl < #rIn_EU_Min) OR (#rTarget_EU_Uncl > #rIn_EU_Max);
+	#rTarget_EU := LIMIT(MN := #rIn_EU_Min, IN := #rTarget_EU_Uncl, MX := #rIn_EU_Max);
+	
+	// ---- oblicz kroki slew na cykl
+	IF #rSlewUp_EUps > 0.0 THEN
+	    #rStepUpMax := #rSlewUp_EUps * #rTs_s;
+	ELSE
+	    #rStepUpMax := 1.0E9;
+	END_IF;
+	IF #rSlewDn_EUps > 0.0 THEN
+	    #rStepDnMax := #rSlewDn_EUps * #rTs_s;
+	ELSE
+	    #rStepDnMax := 1.0E9;
+	END_IF;
+	
+	// ---- HOLD / SLEW
+	#bSlewed := FALSE;
+	IF #bHold THEN
+	    // zamrożenie
+	    #rCmd_EU := #rPrev_EU;
+	ELSE
+	    IF #rTarget_EU > #rPrev_EU THEN
+	        IF (#rTarget_EU - #rPrev_EU) > #rStepUpMax THEN
+	            #rCmd_EU := #rPrev_EU + #rStepUpMax;
+	            #bSlewed := TRUE;
+	        ELSE
+	            #rCmd_EU := #rTarget_EU;
+	        END_IF;
+	    ELSIF #rTarget_EU < #rPrev_EU THEN
+	        IF (#rPrev_EU - #rTarget_EU) > #rStepDnMax THEN
+	            #rCmd_EU := #rPrev_EU - #rStepDnMax;
+	            #bSlewed := TRUE;
+	        ELSE
+	            #rCmd_EU := #rTarget_EU;
+	        END_IF;
+	    ELSE
+	        #rCmd_EU := #rPrev_EU;
+	    END_IF;
+	END_IF;
+	
+	// zapamiętaj
+	#rPrev_EU := #rCmd_EU;
+	
+	// ---- EU -> frac 0..1
+	#rFrac := (#rCmd_EU - #rIn_EU_Min) / #rSpanEU;
+	IF #rFrac < 0.0 THEN
+	    #rFrac := 0.0;
+	END_IF;
+	IF #rFrac > 1.0 THEN
+	    #rFrac := 1.0;
+	END_IF;
+	
+	// ---- frac -> RAW wg typu
+	CASE #iType OF
+	    0: // 4–20 mA
+	        #rTmp := (0.2 + 0.8 * #rFrac) * #rRAW_FS;
+	    1: // 0–20 mA
+	        #rTmp := #rFrac * #rRAW_FS;
+	    2: // 0–10 V
+	        #rTmp := #rFrac * #rRAW_FS;
+	    ELSE
+	        #rTmp := #rFrac * #rRAW_FS;
+	END_CASE;
+	
+	// ---- clamp RAW + flaga
+	#bClamped_RAW := (#rTmp < 0.0) OR (#rTmp > #rRAW_FS);
+	#rTmp := LIMIT(MN := 0.0, IN := #rTmp, MX := #rRAW_FS);
+	
+	// ---- wyjścia RAW
+	#rRaw_AO_Real := #rTmp;
+	#iRaw_AO := REAL_TO_INT(#rRaw_AO_Real);
+	
+	// ---- flaga zbiorcza clamp
+	#bClamped := #bClamped_EU OR #bClamped_RAW;
+END_FUNCTION_BLOCK
+

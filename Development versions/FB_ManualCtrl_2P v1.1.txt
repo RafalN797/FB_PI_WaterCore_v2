@@ -1,0 +1,282 @@
+FUNCTION_BLOCK FB_ManualCtrl_2P
+{ S7_Optimized_Access := 'TRUE' }
+// Manual control for two pumps (P1/P2) on a shared VFD.
+// Adds 10s (configurable) hold-after-stop per pump.
+// States per pump: 0=IDLE, 10=MINRUN, 15=HOLD_AFTER_STOP, 20=REST.
+
+VAR_INPUT
+  bEn               : BOOL := TRUE;
+
+  // Manual PBs (momentary)
+  bPB1_Start        : BOOL := FALSE;
+  bPB1_Stop         : BOOL := FALSE;
+  bPB2_Start        : BOOL := FALSE;
+  bPB2_Stop         : BOOL := FALSE;
+
+  // Local flags (selector/HMI)
+  bLocal_P1         : BOOL := FALSE;
+  bLocal_P2         : BOOL := FALSE;
+
+  // Permissives
+  bPerm_P1          : BOOL := TRUE;
+  bPerm_P2          : BOOL := TRUE;
+
+  // From shared manager / drive
+  bBusySwitch       : BOOL := FALSE;  // manager switching in progress
+  bVFD_RunFB        : BOOL := FALSE;  // optional
+  iOwner            : INT  := 0;      // 0/1/2 (for info/diag)
+
+  // Timings
+  T_MinRun_P1       : TIME := T#20s;
+  T_MinRest_P1      : TIME := T#10s;
+  T_MinRun_P2       : TIME := T#20s;
+  T_MinRest_P2      : TIME := T#10s;
+  T_HoldAfterStop   : TIME := T#10s;  // <-- NEW: contactor hold after STOP
+END_VAR
+
+VAR_OUTPUT
+  // Requests to shared VFD manager
+  iDesiredOwner     : INT;     // 0=none, 1=P1, 2=P2
+  bManReq_Run       : BOOL;    // manual RUN request (level)
+
+  // Diagnostics
+  bManReq_P1        : BOOL;
+  bManReq_P2        : BOOL;
+  iState_P1         : INT;     // 0/10/15/20
+  iState_P2         : INT;     // 0/10/15/20
+  bBlockedByBusy    : BOOL;
+  bBlockedByPerm    : BOOL;
+  bHoldActive_P1    : BOOL;    // <-- NEW
+  bHoldActive_P2    : BOOL;    // <-- NEW
+END_VAR
+
+VAR
+  // Latches
+  bLat_P1           : BOOL := FALSE;
+  bLat_P2           : BOOL := FALSE;
+
+  // PB edges
+  rtr1_Start        : R_TRIG;
+  rtr1_Stop         : R_TRIG;
+  rtr2_Start        : R_TRIG;
+  rtr2_Stop         : R_TRIG;
+
+  // Timers
+  tonMinRun_P1      : TON;
+  tonMinRest_P1     : TON;
+  tonHold_P1        : TON;     // <-- NEW
+  tonMinRun_P2      : TON;
+  tonMinRest_P2     : TON;
+  tonHold_P2        : TON;     // <-- NEW
+
+  // Internals
+  bTryStart_P1      : BOOL;
+  bTryStart_P2      : BOOL;
+  bCanStart_P1      : BOOL;
+  bCanStart_P2      : BOOL;
+
+  bFirstScan        : BOOL := TRUE;
+END_VAR
+
+BEGIN
+  // Defaults
+  bManReq_Run    := FALSE;
+  bManReq_P1     := FALSE;
+  bManReq_P2     := FALSE;
+  bBlockedByBusy := FALSE;
+  bBlockedByPerm := FALSE;
+  bHoldActive_P1 := FALSE;
+  bHoldActive_P2 := FALSE;
+  iDesiredOwner  := 0;
+
+  IF bFirstScan THEN
+    iState_P1 := 0; iState_P2 := 0;
+    tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+    tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+    tonHold_P1   (IN := FALSE, PT := T_HoldAfterStop);
+    tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+    tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+    tonHold_P2   (IN := FALSE, PT := T_HoldAfterStop);
+    bFirstScan := FALSE;
+  END_IF;
+
+  IF NOT bEn THEN
+    bLat_P1 := FALSE; bLat_P2 := FALSE;
+    tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+    tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+    tonHold_P1   (IN := FALSE, PT := T_HoldAfterStop);
+    tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+    tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+    tonHold_P2   (IN := FALSE, PT := T_HoldAfterStop);
+    iDesiredOwner := 0;
+    RETURN;
+  END_IF;
+
+  // PB edges
+  rtr1_Start(CLK := bPB1_Start);
+  rtr1_Stop (CLK := bPB1_Stop);
+  rtr2_Start(CLK := bPB2_Start);
+  rtr2_Stop (CLK := bPB2_Stop);
+
+  // Start intentions only with Local
+  bTryStart_P1 := rtr1_Start.Q AND bLocal_P1;
+  bTryStart_P2 := rtr2_Start.Q AND bLocal_P2;
+
+  // Can start conditions
+  bCanStart_P1 := (NOT bBusySwitch) AND bPerm_P1 AND (NOT tonMinRest_P1.Q) AND (NOT bHoldActive_P1);
+  bCanStart_P2 := (NOT bBusySwitch) AND bPerm_P2 AND (NOT tonMinRest_P2.Q) AND (NOT bHoldActive_P2);
+
+  IF (bTryStart_P1 OR bTryStart_P2) AND bBusySwitch THEN bBlockedByBusy := TRUE; END_IF;
+  IF (bTryStart_P1 AND (NOT bPerm_P1)) OR (bTryStart_P2 AND (NOT bPerm_P2)) THEN bBlockedByPerm := TRUE; END_IF;
+
+  // ================= P1 =================
+  CASE iState_P1 OF
+    // IDLE
+    0:
+      tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+      tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+      tonHold_P1   (IN := FALSE, PT := T_HoldAfterStop);
+      bHoldActive_P1 := FALSE;
+
+      IF bTryStart_P1 AND bCanStart_P1 THEN
+        // mutual exclusion
+        bLat_P2 := FALSE;
+        IF iState_P2 <> 20 THEN
+          // wprowadz P2 do REST
+          tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+          tonHold_P2   (IN := FALSE, PT := T_HoldAfterStop);
+          tonMinRest_P2(IN := TRUE,  PT := T_MinRest_P2);
+          iState_P2 := 20;
+        END_IF;
+
+        bLat_P1 := TRUE;
+        tonMinRun_P1(IN := TRUE, PT := T_MinRun_P1);
+        iState_P1 := 10; // MINRUN
+      END_IF;
+
+      IF rtr1_Stop.Q THEN
+        // nic nie trzymamy – juz jest IDLE
+      END_IF;
+
+    // MINRUN
+    10:
+      tonMinRun_P1(IN := TRUE, PT := T_MinRun_P1);
+
+      IF rtr1_Stop.Q THEN
+        // STOP -> wejdz w HOLD (10 s)
+        bLat_P1 := FALSE;
+        tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+        tonHold_P1(IN := TRUE, PT := T_HoldAfterStop);
+        bHoldActive_P1 := TRUE;
+        iState_P1 := 15; // HOLD_AFTER_STOP
+      END_IF;
+
+      // po min run pozostaje latched do STOP
+      // (brak auto-drop)
+
+    // HOLD_AFTER_STOP – trzymaj właściciela i żądanie RUN przez T_HoldAfterStop
+    15:
+      tonHold_P1(IN := TRUE, PT := T_HoldAfterStop);
+      bHoldActive_P1 := TRUE;
+
+      IF tonHold_P1.Q THEN
+        tonHold_P1(IN := FALSE, PT := T_HoldAfterStop);
+        bHoldActive_P1 := FALSE;
+        // teraz dopiero REST
+        tonMinRest_P1(IN := TRUE, PT := T_MinRest_P1);
+        iState_P1 := 20;
+      END_IF;
+
+    // REST
+    20:
+      tonMinRest_P1(IN := TRUE, PT := T_MinRest_P1);
+      bLat_P1 := FALSE;
+      bHoldActive_P1 := FALSE;
+
+      IF tonMinRest_P1.Q THEN
+        tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+        iState_P1 := 0;
+      END_IF;
+
+  ELSE
+    iState_P1 := 0;
+  END_CASE;
+
+  // ================= P2 =================
+  CASE iState_P2 OF
+    0:
+      tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+      tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+      tonHold_P2   (IN := FALSE, PT := T_HoldAfterStop);
+      bHoldActive_P2 := FALSE;
+
+      IF bTryStart_P2 AND bCanStart_P2 THEN
+        bLat_P1 := FALSE;
+        IF iState_P1 <> 20 THEN
+          tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+          tonHold_P1   (IN := FALSE, PT := T_HoldAfterStop);
+          tonMinRest_P1(IN := TRUE,  PT := T_MinRest_P1);
+          iState_P1 := 20;
+        END_IF;
+
+        bLat_P2 := TRUE;
+        tonMinRun_P2(IN := TRUE, PT := T_MinRun_P2);
+        iState_P2 := 10;
+      END_IF;
+
+      IF rtr2_Stop.Q THEN
+        // nic
+      END_IF;
+
+    10:
+      tonMinRun_P2(IN := TRUE, PT := T_MinRun_P2);
+
+      IF rtr2_Stop.Q THEN
+        bLat_P2 := FALSE;
+        tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+        tonHold_P2(IN := TRUE, PT := T_HoldAfterStop);
+        bHoldActive_P2 := TRUE;
+        iState_P2 := 15; // HOLD_AFTER_STOP
+      END_IF;
+
+    15:
+      tonHold_P2(IN := TRUE, PT := T_HoldAfterStop);
+      bHoldActive_P2 := TRUE;
+
+      IF tonHold_P2.Q THEN
+        tonHold_P2(IN := FALSE, PT := T_HoldAfterStop);
+        bHoldActive_P2 := FALSE;
+        tonMinRest_P2(IN := TRUE, PT := T_MinRest_P2);
+        iState_P2 := 20;
+      END_IF;
+
+    20:
+      tonMinRest_P2(IN := TRUE, PT := T_MinRest_P2);
+      bLat_P2 := FALSE;
+      bHoldActive_P2 := FALSE;
+
+      IF tonMinRest_P2.Q THEN
+        tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+        iState_P2 := 0;
+      END_IF;
+
+  ELSE
+    iState_P2 := 0;
+  END_CASE;
+
+  // ------------- Outputs to manager -------------
+  // Desired owner:
+  IF bHoldActive_P1 OR bLat_P1 THEN
+    iDesiredOwner := 1;
+  ELSIF bHoldActive_P2 OR bLat_P2 THEN
+    iDesiredOwner := 2;
+  ELSE
+    iDesiredOwner := 0;
+  END_IF;
+
+  // Manual RUN request: aktywne gdy latched LUB w hold
+  bManReq_P1 := bLat_P1 OR bHoldActive_P1;
+  bManReq_P2 := bLat_P2 OR bHoldActive_P2;
+  bManReq_Run := bManReq_P1 OR bManReq_P2;
+
+END_FUNCTION_BLOCK

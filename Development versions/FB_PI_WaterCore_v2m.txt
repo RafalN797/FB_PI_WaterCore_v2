@@ -1,0 +1,261 @@
+FUNCTION_BLOCK FB_PI_WaterCore_v2m
+{ S7_Optimized_Access := 'TRUE' }
+// PI core for shared VFD (two pumps).
+// Adds manual PB Start/Stop -> bManDemand (latched).
+// RUN/styczniki nadal poza tym blokiem.
+
+VAR_INPUT
+  // Modes
+  bEn                 : BOOL := TRUE;
+  bLocal_P1           : BOOL := FALSE;
+  bLocal_P2           : BOOL := FALSE;
+
+  // Manual PB (chwilowe)
+  bPB_Start           : BOOL := FALSE;
+  bPB_Stop            : BOOL := FALSE;
+  rManOut_Hz          : REAL := 40.0;     // czestotliwosc w trybie manualnym
+
+  // Process
+  rSP_bar             : REAL := 4.0;
+  rPV_bar             : REAL := 0.0;
+
+  // Tuning
+  rKp_HzPerBar        : REAL := 4.5;
+  rTi_s               : REAL := 18.0;
+  rCycle_s            : REAL := 0.1;
+
+  // Limits & conditioning
+  rHzMin              : REAL := 35.0;
+  rHzMax              : REAL := 50.0;
+  rSP_Ramp_barps      : REAL := 0.05;
+  rPV_Filter_s        : REAL := 1.5;
+  rAw_Kt              : REAL := 0.5;
+
+  // Output shaping
+  rSlewUp_Hzps        : REAL := 0.20;
+  rSlewDn_Hzps        : REAL := 0.20;
+  rOutFilt_s          : REAL := 1.5;
+  rOutMinStep_Hz      : REAL := 0.05;
+
+  // Auto-demand thresholds
+  rAutoOnTh_Hz        : REAL := 36.0;
+  rAutoOffTh_Hz       : REAL := 35.0;
+
+  // Integrator deadband
+  rI_Deadband_bar     : REAL := 0.03;
+END_VAR
+
+VAR_OUTPUT
+  // Wyjscie zadania VFD
+  rOut_Hz             : REAL;
+  rOut_Pct            : REAL;
+  bActive             : BOOL;
+
+  // Żądania do managera RUN
+  bAutoDemand         : BOOL;    // z PI (wygaszane przez Local)
+  bManDemand          : BOOL;    // z przycisków (zatrzask)
+
+  // Diagnostyka
+  rErr_bar            : REAL;
+  rSPi_bar            : REAL;
+  rPVf_bar            : REAL;
+  rP_Hz               : REAL;
+  rI_Hz               : REAL;
+  bSatHi              : BOOL;
+  bSatLo              : BOOL;
+  bI_Frozen           : BOOL;
+END_VAR
+
+VAR
+  // PI stany
+  rI                  : REAL;
+  rOutRaw             : REAL;
+  rOutPrev            : REAL;
+  rPrevSP             : REAL;
+  rPrevPVf            : REAL;
+  bFirstScan          : BOOL := TRUE;
+
+  // Temp
+  rT                  : REAL;
+  rMaxStepSP          : REAL;
+  rAlphaPV            : REAL;
+  rAlphaOut           : REAL;
+  rStepMaxUp          : REAL;
+  rStepMaxDn          : REAL;
+  rDelta              : REAL;
+  rBackCalc           : REAL;
+
+  // Manual latch
+  rtrStart            : R_TRIG;
+  rtrStop             : R_TRIG;
+  bManLatch           : BOOL := FALSE;
+
+  bAnyLocal           : BOOL;
+END_VAR
+
+BEGIN
+  // Domysly
+  bActive := FALSE; bSatHi := FALSE; bSatLo := FALSE; bI_Frozen := FALSE;
+
+  // Sample time guard
+  rT := rCycle_s; IF rT <= 0.0 THEN rT := 0.1; END_IF;
+
+  // First scan
+  IF bFirstScan THEN
+    rSPi_bar  := rSP_bar;
+    rPVf_bar  := rPV_bar;
+    rPrevSP   := rSPi_bar;
+    rPrevPVf  := rPVf_bar;
+    rI        := 0.0;
+    rOutPrev  := rHzMin;
+    bFirstScan := FALSE;
+  END_IF;
+
+  // Disabled → trzymamy min, kasujemy ządania
+  IF NOT bEn THEN
+    rOut_Hz     := rHzMin;
+    rOut_Pct    := 0.0;
+    bAutoDemand := FALSE;
+    bManDemand  := FALSE;
+    bManLatch   := FALSE;
+    RETURN;
+  END_IF;
+
+  // Local flags
+  bAnyLocal := bLocal_P1 OR bLocal_P2;
+
+  // --- Manual latch (PB momentary) ---
+  rtrStart(CLK := bPB_Start);
+  rtrStop (CLK := bPB_Stop);
+
+  IF rtrStart.Q THEN
+    bManLatch := TRUE;
+  END_IF;
+  IF rtrStop.Q THEN
+    bManLatch := FALSE;
+  END_IF;
+
+  // --- SP ramp ---
+  rMaxStepSP := rSP_Ramp_barps * rT; IF rMaxStepSP < 0.0 THEN rMaxStepSP := 0.0; END_IF;
+  IF rSP_bar > rPrevSP + rMaxStepSP THEN
+    rSPi_bar := rPrevSP + rMaxStepSP;
+  ELSIF rSP_bar < rPrevSP - rMaxStepSP THEN
+    rSPi_bar := rPrevSP - rMaxStepSP;
+  ELSE
+    rSPi_bar := rSP_bar;
+  END_IF;
+  rPrevSP := rSPi_bar;
+
+  // --- PV filter ---
+  IF rPV_Filter_s <= 0.0 THEN
+    rPVf_bar := rPV_bar;
+  ELSE
+    rAlphaPV := rT / (rPV_Filter_s + rT);
+    IF rAlphaPV < 0.0 THEN rAlphaPV := 0.0; END_IF;
+    IF rAlphaPV > 1.0 THEN rAlphaPV := 1.0; END_IF;
+    rPVf_bar := rPrevPVf + rAlphaPV * (rPV_bar - rPrevPVf);
+    rPrevPVf := rPVf_bar;
+  END_IF;
+
+  // --- PI core (liczymy zawsze; wyjscie wybieramy nizej) ---
+  rErr_bar := rSPi_bar - rPVf_bar;
+  rP_Hz    := rKp_HzPerBar * rErr_bar;
+
+  rOutRaw := rP_Hz + rI;
+  bSatLo  := (rOutRaw <= rHzMin + 0.01);
+  bSatHi  := (rOutRaw >= rHzMax - 0.01);
+
+  bI_Frozen := FALSE;
+  IF ( (bSatHi AND (rErr_bar > 0.0)) OR
+       (bSatLo AND (rErr_bar < 0.0)) OR
+       (ABS(rErr_bar) < rI_Deadband_bar) ) THEN
+    bI_Frozen := TRUE;
+  END_IF;
+
+  IF rTi_s > 0.0 THEN
+    VAR_TEMP rLimited : REAL;
+    rLimited := rOutRaw;
+    IF rLimited < rHzMin THEN rLimited := rHzMin; END_IF;
+    IF rLimited > rHzMax THEN rLimited := rHzMax; END_IF;
+    rBackCalc := rAw_Kt * (rLimited - rOutRaw);
+    IF NOT bI_Frozen THEN
+      rI := rI + (rKp_HzPerBar * (rT / rTi_s) * rErr_bar) + rBackCalc;
+    END_IF;
+  ELSE
+    rI := 0.0;
+  END_IF;
+
+  // Sum + clamp
+  rOutRaw := rP_Hz + rI;
+  IF rOutRaw < rHzMin THEN rOutRaw := rHzMin; END_IF;
+  IF rOutRaw > rHzMax THEN rOutRaw := rHzMax; END_IF;
+
+  // Slew limits
+  IF rSlewUp_Hzps > 0.0 THEN rStepMaxUp := rSlewUp_Hzps * rT; ELSE rStepMaxUp := 999999.0; END_IF;
+  IF rSlewDn_Hzps > 0.0 THEN rStepMaxDn := rSlewDn_Hzps * rT; ELSE rStepMaxDn := 999999.0; END_IF;
+
+  rDelta := rOutRaw - rOutPrev;
+  IF rDelta > rStepMaxUp THEN
+    rOutRaw := rOutPrev + rStepMaxUp;
+  ELSIF rDelta < -rStepMaxDn THEN
+    rOutRaw := rOutPrev - rStepMaxDn;
+  END_IF;
+
+  // Output LPF
+  IF rOutFilt_s > 0.0 THEN
+    rAlphaOut := rT / (rOutFilt_s + rT);
+    IF rAlphaOut < 0.0 THEN rAlphaOut := 0.0; END_IF;
+    IF rAlphaOut > 1.0 THEN rAlphaOut := 1.0; END_IF;
+    rOutRaw := rOutPrev + rAlphaOut * (rOutRaw - rOutPrev);
+  END_IF;
+
+  // Min step
+  IF ABS(rOutRaw - rOutPrev) < rOutMinStep_Hz THEN
+    rOut_Hz := rOutPrev;
+  ELSE
+    rOut_Hz := rOutRaw;
+  END_IF;
+
+  // Final clamp
+  IF rOut_Hz < rHzMin THEN rOut_Hz := rHzMin; END_IF;
+  IF rOut_Hz > rHzMax THEN rOut_Hz := rHzMax; END_IF;
+
+  // --- Wybór wyjścia: MANUAL vs PI ---
+  IF bManLatch THEN
+    // manualne zadanie czestotliwosci
+    rOut_Hz := rManOut_Hz;
+    IF rOut_Hz < rHzMin THEN rOut_Hz := rHzMin; END_IF;
+    IF rOut_Hz > rHzMax THEN rOut_Hz := rHzMax; END_IF;
+  END_IF;
+
+  // Store
+  rOutPrev := rOut_Hz;
+
+  // Percent
+  IF (rHzMax - rHzMin) > 0.0 THEN
+    rOut_Pct := 100.0 * (rOut_Hz - rHzMin) / (rHzMax - rHzMin);
+    IF rOut_Pct < 0.0 THEN rOut_Pct := 0.0; END_IF;
+    IF rOut_Pct > 100.0 THEN rOut_Pct := 100.0; END_IF;
+  ELSE
+    rOut_Pct := 0.0;
+  END_IF;
+
+  // Żądania do managera RUN
+  // AutoDemand wyciszone przez Local (jak wczesniej)
+  IF bLocal_P1 OR bLocal_P2 THEN
+    bAutoDemand := FALSE;
+  ELSE
+    IF rOut_Hz >= rAutoOnTh_Hz THEN
+      bAutoDemand := TRUE;
+    ELSIF rOut_Hz <= rAutoOffTh_Hz THEN
+      bAutoDemand := FALSE;
+    END_IF;
+  END_IF;
+
+  // Manualne ządanie (niezależne od Local) – manager może dac priorytet Local
+  bManDemand := bManLatch;
+
+  bActive := TRUE;
+  rI_Hz   := rI;
+
+END_FUNCTION_BLOCK

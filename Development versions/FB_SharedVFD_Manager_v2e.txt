@@ -1,0 +1,181 @@
+FUNCTION_BLOCK FB_SharedVFD_Manager_v2e
+{ S7_Optimized_Access := 'TRUE' }
+// Two pumps on one VFD, anti-chatter switching.
+// iSwState: 0=READY, 10=RUN_OFF, 40=DEADTIME
+
+VAR_INPUT
+  bEn               : BOOL := TRUE;
+  bLocal_P1         : BOOL := FALSE;
+  bLocal_P2         : BOOL := FALSE;
+
+  // Auto side
+  bAutoDemand       : BOOL := FALSE;
+  bAutoSel_P1       : BOOL := TRUE;
+  bAutoSel_P2       : BOOL := FALSE;
+
+  // PB (opcjonalnie)
+  bPB_Start         : BOOL := FALSE;
+  bPB_Stop          : BOOL := FALSE;
+
+  // Interlocks / feedbacks
+  bPermOk           : BOOL := TRUE;
+  bVFD_Fault        : BOOL := FALSE;
+  bVFD_RunFB        : BOOL := FALSE;
+  bFb_K1            : BOOL := FALSE;
+  bFb_K2            : BOOL := FALSE;
+
+  // Timings
+  T_LocalDebounce   : TIME := T#200ms;
+  T_StopToOpen      : TIME := T#2s;      // hold przed otwarciem przy PRZEŁĄCZANIU gałęzi
+  T_Deadtime        : TIME := T#300ms;
+
+  // NEW: keep contactor even when stopped (legacy behavior)
+  bKeepContactorWhenStopped : BOOL := FALSE;   // domyślnie: NIE trzymaj na postoju
+END_VAR
+
+VAR_OUTPUT
+  bDO_K1            : BOOL;
+  bDO_K2            : BOOL;
+  bDO_VFD_Run       : BOOL;
+  iOwner            : INT;
+  iSwState          : INT;
+  bBusySwitch       : BOOL;
+  bAlm_BothFb       : BOOL;
+END_VAR
+
+VAR
+  tonLoc1, tonLoc2  : TON;
+  bLoc1_Db, bLoc2_Db: BOOL;
+
+  tonStopToOpen     : TON;
+  tonDead           : TON;
+
+  rtrStart, rtrStop : R_TRIG;
+  bRunLatch         : BOOL := FALSE;
+
+  iOwner_Int        : INT := 0;
+  iDesiredOwner     : INT := 0;
+
+  bAnyLocal         : BOOL;
+  bPermAllOk        : BOOL;
+  bAutoAsk          : BOOL;
+
+  bFirstScan        : BOOL := TRUE;
+END_VAR
+
+BEGIN
+  // defaults
+  bDO_K1 := FALSE; bDO_K2 := FALSE; bDO_VFD_Run := FALSE; bAlm_BothFb := FALSE;
+
+  IF bFirstScan THEN
+    iSwState := 0; iOwner_Int := 0; bRunLatch := FALSE;
+    tonLoc1(IN := FALSE, PT := T_LocalDebounce);
+    tonLoc2(IN := FALSE, PT := T_LocalDebounce);
+    tonStopToOpen(IN := FALSE, PT := T_StopToOpen);
+    tonDead(IN := FALSE, PT := T_Deadtime);
+    bFirstScan := FALSE;
+  END_IF;
+
+  // global
+  bPermAllOk := bEn AND bPermOk AND (NOT bVFD_Fault);
+
+  // debounce Local
+  tonLoc1(IN := bLocal_P1, PT := T_LocalDebounce);
+  tonLoc2(IN := bLocal_P2, PT := T_LocalDebounce);
+  bLoc1_Db := tonLoc1.Q; bLoc2_Db := tonLoc2.Q;
+  bAnyLocal := bLoc1_Db OR bLoc2_Db;
+
+  // alarm fb
+  IF bFb_K1 AND bFb_K2 THEN bAlm_BothFb := TRUE; END_IF;
+
+  // desired owner (Local > Auto pref)
+  IF bLoc1_Db THEN
+    iDesiredOwner := 1;
+  ELSIF bLoc2_Db THEN
+    iDesiredOwner := 2;
+  ELSE
+    IF bAutoSel_P1 AND (NOT bAutoSel_P2) THEN
+      iDesiredOwner := 1;
+    ELSIF bAutoSel_P2 AND (NOT bAutoSel_P1) THEN
+      iDesiredOwner := 2;
+    ELSE
+      iDesiredOwner := iOwner_Int; // brak zmiany
+    END_IF;
+  END_IF;
+
+  // auto demand suppressed by Local
+  IF bAnyLocal THEN bAutoAsk := FALSE; ELSE bAutoAsk := bAutoDemand; END_IF;
+
+  // PB edges
+  rtrStart(CLK := bPB_Start);
+  rtrStop (CLK := bPB_Stop);
+
+  // FSM
+  CASE iSwState OF
+    0: // READY
+      // jeśli trzeba zmienić gałąź -> rozpocznij procedurę
+      IF (iOwner_Int <> iDesiredOwner) THEN
+        bRunLatch := FALSE;
+        tonStopToOpen(IN := TRUE, PT := T_StopToOpen);
+        iSwState := 10;
+      ELSE
+        // normalny latch RUN
+        IF (rtrStart.Q OR bAutoAsk) AND bPermAllOk AND (iOwner_Int <> 0) THEN
+          bRunLatch := TRUE;
+        END_IF;
+        IF rtrStop.Q OR (NOT bAutoAsk) OR (NOT bPermAllOk) THEN
+          bRunLatch := FALSE;
+        END_IF;
+      END_IF;
+
+    10: // RUN_OFF (przełączanie)
+      tonStopToOpen(IN := TRUE, PT := T_StopToOpen);
+      IF tonStopToOpen.Q OR (NOT bVFD_RunFB) THEN
+        tonStopToOpen(IN := FALSE, PT := T_StopToOpen);
+        iOwner_Int := iDesiredOwner;
+        tonDead(IN := TRUE, PT := T_Deadtime);
+        iSwState := 40;
+      END_IF;
+
+    40: // DEADTIME
+      tonDead(IN := TRUE, PT := T_Deadtime);
+      IF tonDead.Q THEN
+        tonDead(IN := FALSE, PT := T_Deadtime);
+        iSwState := 0;
+      END_IF;
+
+  ELSE
+    iSwState := 0;
+  END_CASE;
+
+  // RUN tylko w READY
+  IF iSwState = 0 THEN
+    bDO_VFD_Run := bRunLatch AND bPermAllOk AND (iOwner_Int <> 0);
+  ELSE
+    bDO_VFD_Run := FALSE;
+  END_IF;
+
+  // Styki: tylko gdy RUN albo (opcjonalnie) gdy chcesz trzymać na postoju
+  IF iSwState = 0 THEN
+    IF (bDO_VFD_Run OR bKeepContactorWhenStopped) THEN
+      IF iOwner_Int = 1 THEN
+        bDO_K1 := TRUE; bDO_K2 := FALSE;
+      ELSIF iOwner_Int = 2 THEN
+        bDO_K1 := FALSE; bDO_K2 := TRUE;
+      ELSE
+        bDO_K1 := FALSE; bDO_K2 := FALSE;
+      END_IF;
+    ELSE
+      // RUN=FALSE i nie trzymamy na postoju -> OBIE cewki OFF
+      bDO_K1 := FALSE; bDO_K2 := FALSE;
+    END_IF;
+  ELSE
+    // podczas przełączania wszystko OFF
+    bDO_K1 := FALSE; bDO_K2 := FALSE;
+  END_IF;
+
+  // status
+  iOwner := iOwner_Int;
+  bBusySwitch := (iSwState <> 0);
+
+END_FUNCTION_BLOCK

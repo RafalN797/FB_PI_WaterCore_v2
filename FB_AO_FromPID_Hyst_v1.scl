@@ -1,0 +1,186 @@
+﻿FUNCTION_BLOCK "FB_AO_FromPID_Hyst_v1"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      rPid_Out_EU : Real;   // np. 35..50 Hz
+      rIn_EU_Min : Real;   // np. 35.0
+      rIn_EU_Max : Real;   // np. 50.0
+      bEnable : Bool := true;   // global enable (master)
+      rStartOn_EU : Real := 35.0;   // latch ACTIVE when rPid_Out_EU >= StartOn
+      rStartOff_EU : Real := 50.0;   // unlatch ACTIVE when rPid_Out_EU <= StartOff (must be <= StartOn)
+      rSlewUp_EUps : Real;   // Slew (rate limit) in EU/s and task sample time [s] 0 = unlimited
+      rSlewDn_EUps : Real;   // Slew (rate limit) in EU/s and task sample time [s] 0 = unlimited
+      rTs_s : Real := 0.1;   // OB1 cycle in seconds
+      bHold : Bool;
+      iAO_Type : Int;   // 0=I_4_20, 1=I_0_20, 2=V_0_10
+   END_VAR
+
+   VAR_OUTPUT 
+      rCmd_EU : Real;
+      iRaw_AO : Int;
+      rRaw_AO_Real : Real;
+      bActive : Bool;   // hysteresis-latched ACTIVE state
+      bClamped : Bool;   // EU or RAW clamp occurred
+      bClamped_EU : Bool;   // EU clamp flag
+      bClamped_RAW : Bool;   // RAW clamp flag
+      bSlewed : Bool;   // slew applied this scan
+   END_VAR
+
+   VAR 
+      rRAW_FS : Real := 27648.0;
+      iType : Int;
+      rSpanEU : Real := 0.1;
+      rOn : Real := 35.0;   // sanitized StartOn
+      rOff : Real := 34.0;   // sanitized StartOff (<= StartOn)
+      rTarget_EU_Uncl : Real;   // target before EU clamp
+      rTarget_EU : Real;   // target after EU clamp
+      rPrev_EU : Real;   // previous rCmd_EU
+      rStepUpMax : Real;
+      rStepDnMax : Real;
+      rFrac : Real;   // 0..1 within [rIn_EU_Min..rIn_EU_Max]
+      rTmp : Real;   // temp for RAW
+   END_VAR
+
+
+BEGIN
+	//FUNCTION_BLOCK "FB_AO_FromPID_Hyst_v1"
+	// S7_Optimized_Access := 'TRUE' 
+	// PID EU -> AO RAW (0..27648) with start/stop hysteresis, slew and clamp flags
+	// AO types: 0=I_4_20mA, 1=I_0_20mA, 2=V_0_10V
+	// RAW FS = 27648 (S7 AO). Live-zero for 4–20 mA = 20% FS.
+	// 
+	REGION Sanitize
+	    #bActive := FALSE;   // default state
+	    #rCmd_EU := 0.0;
+	    // ---- Sanitize thresholds & ranges
+	    #rSpanEU := #rIn_EU_Max - #rIn_EU_Min;
+	    IF #rSpanEU = 0.0 THEN
+	        #rSpanEU := 1.0;
+	    END_IF;
+	END_REGION
+	// Ensure StartOff <= StartOn (auto-fix if user swapped them)
+	IF #rStartOn_EU >= #rStartOff_EU THEN
+	    #rOn := #rStartOn_EU;
+	    #rOff := #rStartOff_EU;
+	ELSE
+	    // swap
+	    #rOn := #rStartOff_EU;
+	    #rOff := #rStartOn_EU;
+	END_IF;
+	
+	// Hard clamp thresholds into engineering window (optional but safe)
+	#rOn := LIMIT(MN := #rIn_EU_Min, IN := #rOn, MX := #rIn_EU_Max);
+	#rOff := LIMIT(MN := #rIn_EU_Min, IN := #rOff, MX := #rIn_EU_Max);
+	
+	// ---- AO type clamp
+	IF #iAO_Type < 0 THEN
+	    #iType := 0;
+	ELSIF #iAO_Type > 2 THEN
+	    #iType := 2;
+	ELSE
+	    #iType := #iAO_Type;
+	END_IF;
+	REGION Hysteresis
+	    // ---- Hysteresis latch for ACTIVE
+	    // When disabled globally -> inactive
+	    IF NOT #bEnable THEN
+	        #bActive := FALSE;
+	    ELSE
+	        // Enable is TRUE -> hysteresis:
+	        IF NOT #bActive THEN
+	            // currently inactive: arm only on rising above StartOn
+	            IF #rPid_Out_EU >= #rOn THEN
+	                #bActive := TRUE;
+	            END_IF;
+	        ELSE
+	            // currently active: drop only when BELOW or equal StartOff
+	            IF #rPid_Out_EU <= #rOff THEN
+	                #bActive := FALSE;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+	// ---- Compute unclamped target EU
+	IF #bActive THEN
+	    #rTarget_EU_Uncl := #rPid_Out_EU;
+	ELSE
+	    #rTarget_EU_Uncl := #rIn_EU_Min;  // when inactive, fall back to EU_Min
+	END_IF;
+	
+	// ---- EU clamp (and flag)
+	#bClamped_EU := (#rTarget_EU_Uncl < #rIn_EU_Min) OR (#rTarget_EU_Uncl > #rIn_EU_Max);
+	#rTarget_EU := LIMIT(MN := #rIn_EU_Min, IN := #rTarget_EU_Uncl, MX := #rIn_EU_Max);
+	REGION Slew
+	    // ---- Slew rate limits (EU/scan)
+	    IF #rSlewUp_EUps > 0.0 THEN
+	        #rStepUpMax := #rSlewUp_EUps * #rTs_s;
+	    ELSE
+	        #rStepUpMax := 1.0E9;
+	    END_IF;
+	    
+	    IF #rSlewDn_EUps > 0.0 THEN
+	        #rStepDnMax := #rSlewDn_EUps * #rTs_s;
+	    ELSE
+	        #rStepDnMax := 1.0E9;
+	    END_IF;
+	END_REGION
+	// ---- HOLD or move towards target with slew
+	#bSlewed := FALSE;
+	IF #bHold THEN
+	    #rCmd_EU := #rPrev_EU;
+	ELSE
+	    IF #rTarget_EU > #rPrev_EU THEN
+	        IF (#rTarget_EU - #rPrev_EU) > #rStepUpMax THEN
+	            #rCmd_EU := #rPrev_EU + #rStepUpMax;
+	            #bSlewed := TRUE;
+	        ELSE
+	            #rCmd_EU := #rTarget_EU;
+	        END_IF;
+	    ELSIF #rTarget_EU < #rPrev_EU THEN
+	        IF (#rPrev_EU - #rTarget_EU) > #rStepDnMax THEN
+	            #rCmd_EU := #rPrev_EU - #rStepDnMax;
+	            #bSlewed := TRUE;
+	        ELSE
+	            #rCmd_EU := #rTarget_EU;
+	        END_IF;
+	    ELSE
+	        #rCmd_EU := #rPrev_EU; // no change
+	    END_IF;
+	END_IF;
+	
+	// remember for next cycle
+	#rPrev_EU := #rCmd_EU;
+	REGION fraction
+	// ---- EU -> fraction 0..1
+	#rFrac := (#rCmd_EU - #rIn_EU_Min) / #rSpanEU;
+	IF #rFrac < 0.0 THEN
+	    #rFrac := 0.0;
+	END_IF;
+	IF #rFrac > 1.0 THEN
+	    #rFrac := 1.0;
+	END_IF;
+	END_REGION
+	REGION QA Scaled
+	    // ---- fraction -> RAW by type
+	    CASE #iType OF
+	        0: // I_4_20mA  (live-zero: 20%..100%)
+	            #rTmp := (0.2 + 0.8 * #rFrac) * #rRAW_FS;
+	        1: // I_0_20mA  (0..100%)
+	            #rTmp := #rFrac * #rRAW_FS;
+	        2: // V_0_10V   (0..100%)
+	            #rTmp := #rFrac * #rRAW_FS;
+	        ELSE
+	            #rTmp := #rFrac * #rRAW_FS;
+	    END_CASE;
+	END_REGION
+	// ---- RAW clamp + flags
+	#bClamped_RAW := (#rTmp < 0.0) OR (#rTmp > #rRAW_FS);
+	#rTmp := LIMIT(MN := 0.0, IN := #rTmp, MX := #rRAW_FS);
+	
+	#rRaw_AO_Real := #rTmp;
+	#iRaw_AO := REAL_TO_INT(#rRaw_AO_Real);
+	
+	// ---- Combined clamp flag
+	#bClamped := #bClamped_EU OR #bClamped_RAW;
+END_FUNCTION_BLOCK
+

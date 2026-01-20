@@ -1,0 +1,258 @@
+FUNCTION_BLOCK FB_ManualCtrl_2P
+{ S7_Optimized_Access := 'TRUE' }
+// Manual control for two pumps (P1/P2) on a shared VFD.
+// Outputs desired owner and manual RUN request for an external shared-VFD manager.
+// Mutual exclusion (only one pump can be requested), min run/rest per pump,
+// and inhibit while the shared manager is switching (bBusySwitch).
+
+VAR_INPUT
+  bEn               : BOOL := TRUE;
+
+  // Manual PBs (momentary)
+  bPB1_Start        : BOOL := FALSE;
+  bPB1_Stop         : BOOL := FALSE;
+  bPB2_Start        : BOOL := FALSE;
+  bPB2_Stop         : BOOL := FALSE;
+
+  // Local flags (usually from HMI/selector)
+  bLocal_P1         : BOOL := FALSE;
+  bLocal_P2         : BOOL := FALSE;
+
+  // Permissives per pump
+  bPerm_P1          : BOOL := TRUE;
+  bPerm_P2          : BOOL := TRUE;
+
+  // Status from shared manager / drive
+  bBusySwitch       : BOOL := FALSE;  // TRUE while manager is switching branches
+  bVFD_RunFB        : BOOL := FALSE;  // optional: VFD running feedback
+  iOwner            : INT  := 0;      // current owner from manager (0/1/2)
+
+  // Timings (per pump)
+  T_MinRun_P1       : TIME := T#20s;
+  T_MinRest_P1      : TIME := T#10s;
+  T_MinRun_P2       : TIME := T#20s;
+  T_MinRest_P2      : TIME := T#10s;
+END_VAR
+
+VAR_OUTPUT
+  // Requests to shared VFD manager
+  iDesiredOwner     : INT;     // 0=none, 1=P1, 2=P2 (manual desired owner)
+  bManReq_Run       : BOOL;    // manual RUN request (level)
+
+  // Diagnostics
+  bManReq_P1        : BOOL;    // P1 manual demand active (latched)
+  bManReq_P2        : BOOL;    // P2 manual demand active (latched)
+  iState_P1         : INT;     // 0=IDLE,10=MINRUN,20=REST
+  iState_P2         : INT;     // 0=IDLE,10=MINRUN,20=REST
+  bBlockedByBusy    : BOOL;    // start attempt blocked due to switching
+  bBlockedByPerm    : BOOL;    // start attempt blocked due to permissives
+END_VAR
+
+VAR
+  // Latches
+  bLat_P1           : BOOL := FALSE;
+  bLat_P2           : BOOL := FALSE;
+
+  // PB edges
+  rtr1_Start        : R_TRIG;
+  rtr1_Stop         : R_TRIG;
+  rtr2_Start        : R_TRIG;
+  rtr2_Stop         : R_TRIG;
+
+  // Timers
+  tonMinRun_P1      : TON;
+  tonMinRest_P1     : TON;
+  tonMinRun_P2      : TON;
+  tonMinRest_P2     : TON;
+
+  // Internals
+  bTryStart_P1      : BOOL;
+  bTryStart_P2      : BOOL;
+  bCanStart_P1      : BOOL;
+  bCanStart_P2      : BOOL;
+
+  bFirstScan        : BOOL := TRUE;
+END_VAR
+
+BEGIN
+  // Defaults
+  bManReq_Run    := FALSE;
+  bManReq_P1     := FALSE;
+  bManReq_P2     := FALSE;
+  bBlockedByBusy := FALSE;
+  bBlockedByPerm := FALSE;
+  iDesiredOwner  := 0;
+
+  IF bFirstScan THEN
+    iState_P1 := 0; iState_P2 := 0;
+    tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+    tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+    tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+    tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+    bFirstScan := FALSE;
+  END_IF;
+
+  // If disabled -> clear latches and timers, no requests
+  IF NOT bEn THEN
+    bLat_P1 := FALSE; bLat_P2 := FALSE;
+    tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+    tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+    tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+    tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+    iDesiredOwner := 0;
+    RETURN;
+  END_IF;
+
+  // PB edges
+  rtr1_Start(CLK := bPB1_Start);
+  rtr1_Stop (CLK := bPB1_Stop);
+  rtr2_Start(CLK := bPB2_Start);
+  rtr2_Stop (CLK := bPB2_Stop);
+
+  // Try-start intentions only when corresponding Local is active
+  bTryStart_P1 := rtr1_Start.Q AND bLocal_P1;
+  bTryStart_P2 := rtr2_Start.Q AND bLocal_P2;
+
+  // Can start conditions per pump
+  bCanStart_P1 := (NOT bBusySwitch) AND bPerm_P1 AND (NOT tonMinRest_P1.Q);
+  bCanStart_P2 := (NOT bBusySwitch) AND bPerm_P2 AND (NOT tonMinRest_P2.Q);
+
+  // Flags for blocks
+  IF (bTryStart_P1 OR bTryStart_P2) AND bBusySwitch THEN
+    bBlockedByBusy := TRUE;
+  END_IF;
+  IF (bTryStart_P1 AND (NOT bPerm_P1)) OR (bTryStart_P2 AND (NOT bPerm_P2)) THEN
+    bBlockedByPerm := TRUE;
+  END_IF;
+
+  // ---------------- P1 latch / states ----------------
+  CASE iState_P1 OF
+    // IDLE
+    0:
+      tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+      tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+
+      // Start latch
+      IF bTryStart_P1 AND bCanStart_P1 THEN
+        // mutual exclusion: drop P2 latch
+        bLat_P2 := FALSE;
+        iState_P2 := 20;                // force P2 into REST (if it was active)
+        tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+        tonMinRest_P2(IN := TRUE,  PT := T_MinRest_P2);
+
+        bLat_P1 := TRUE;
+        tonMinRun_P1(IN := TRUE, PT := T_MinRun_P1);
+        iState_P1 := 10;                // MINRUN
+      END_IF;
+
+      // Manual STOP clears latch immediately (even during rest)
+      IF rtr1_Stop.Q THEN
+        bLat_P1 := FALSE;
+        tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+        tonMinRest_P1(IN := TRUE,  PT := T_MinRest_P1);
+        iState_P1 := 20;                // REST
+      END_IF;
+
+    // MINRUN (latched and protecting minimal run time)
+    10:
+      tonMinRun_P1(IN := TRUE, PT := T_MinRun_P1);
+
+      // STOP command allowed but we still complete REST after
+      IF rtr1_Stop.Q THEN
+        bLat_P1 := FALSE;
+        tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+        tonMinRest_P1(IN := TRUE,  PT := T_MinRest_P1);
+        iState_P1 := 20;                // REST
+      END_IF;
+
+      // Optional: if VFD_RunFB is available and goes FALSE unexpectedly, you may drop to REST
+      // (left as-is; no automatic drop here to keep manual control predictable)
+
+      // After min run time, remain latched until STOP; state can stay 10 or go back to 0
+      IF tonMinRun_P1.Q THEN
+        // keep state 10 for clarity (latched); STOP will move to REST
+      END_IF;
+
+    // REST (enforce minimum rest before next start)
+    20:
+      tonMinRest_P1(IN := TRUE, PT := T_MinRest_P1);
+      bLat_P1 := FALSE;
+
+      IF tonMinRest_P1.Q THEN
+        tonMinRest_P1(IN := FALSE, PT := T_MinRest_P1);
+        iState_P1 := 0;                 // back to IDLE
+      END_IF;
+  ELSE
+    iState_P1 := 0;
+  END_CASE;
+
+  // ---------------- P2 latch / states ----------------
+  CASE iState_P2 OF
+    // IDLE
+    0:
+      tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+      tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+
+      IF bTryStart_P2 AND bCanStart_P2 THEN
+        // mutual exclusion: drop P1 latch
+        bLat_P1 := FALSE;
+        iState_P1 := 20;
+        tonMinRun_P1(IN := FALSE, PT := T_MinRun_P1);
+        tonMinRest_P1(IN := TRUE,  PT := T_MinRest_P1);
+
+        bLat_P2 := TRUE;
+        tonMinRun_P2(IN := TRUE, PT := T_MinRun_P2);
+        iState_P2 := 10;                // MINRUN
+      END_IF;
+
+      IF rtr2_Stop.Q THEN
+        bLat_P2 := FALSE;
+        tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+        tonMinRest_P2(IN := TRUE,  PT := T_MinRest_P2);
+        iState_P2 := 20;                // REST
+      END_IF;
+
+    // MINRUN
+    10:
+      tonMinRun_P2(IN := TRUE, PT := T_MinRun_P2);
+
+      IF rtr2_Stop.Q THEN
+        bLat_P2 := FALSE;
+        tonMinRun_P2(IN := FALSE, PT := T_MinRun_P2);
+        tonMinRest_P2(IN := TRUE,  PT := T_MinRest_P2);
+        iState_P2 := 20;                // REST
+      END_IF;
+
+      IF tonMinRun_P2.Q THEN
+        // keep latched until STOP
+      END_IF;
+
+    // REST
+    20:
+      tonMinRest_P2(IN := TRUE, PT := T_MinRest_P2);
+      bLat_P2 := FALSE;
+
+      IF tonMinRest_P2.Q THEN
+        tonMinRest_P2(IN := FALSE, PT := T_MinRest_P2);
+        iState_P2 := 0;                 // back to IDLE
+      END_IF;
+  ELSE
+    iState_P2 := 0;
+  END_CASE;
+
+  // ---------------- Outputs to shared manager ----------------
+  // Desired owner: prefer the latched pump; if both latched (should not happen), P1 wins.
+  IF bLat_P1 THEN
+    iDesiredOwner := 1;
+  ELSIF bLat_P2 THEN
+    iDesiredOwner := 2;
+  ELSE
+    iDesiredOwner := 0;
+  END_IF;
+
+  // Manual RUN request = any latch active
+  bManReq_P1 := bLat_P1;
+  bManReq_P2 := bLat_P2;
+  bManReq_Run := bLat_P1 OR bLat_P2;
+
+END_FUNCTION_BLOCK
